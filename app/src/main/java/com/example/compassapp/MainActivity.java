@@ -7,46 +7,60 @@ import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.os.Bundle;
-import android.view.animation.Animation;
-import android.view.animation.RotateAnimation;
 import android.widget.ImageView;
 import android.widget.TextView;
 
-public class MainActivity extends AppCompatActivity implements SensorEventListener {
-    Float azimuth_angle;
-    private SensorManager compassSensorManager;
-    Sensor accelerometer;
-    Sensor magnetometer;
-    TextView tv_degrees;
-    ImageView iv_compass;
-    private float current_degree = 0f;
+import java.util.Locale;
 
-    float[] accel_read;
-    float[] magnetic_read;
+public class MainActivity extends AppCompatActivity implements SensorEventListener {
+
+    // Resources
+    private TextView tv_degrees;
+    private ImageView iv_compass;
+
+    // Sensors
+    private SensorManager compassSensorManager;
+    private Sensor accelerometer;
+    private Sensor magnetometer;
+
+    // Calculators - reuse arrays to avoid repeated allocations
+    private float[] acc_val = new float[3];
+    private float[] mag_val = new float[3];
+    private float[] rotation_matrix = new float[9];
+    private float[] orientation = new float[3];
+    private boolean has_acc_data = false;
+    private boolean has_mag_data = false;
+
+    // Low-pass filter for smoother compass rotation
+    private static final float ALPHA = 0.5f;  // Lower = smoother, Higher = more responsive
+    private float current_azimuth = 0f;
+
+    // Track last update time for real-time optimization
+    private long last_update_time = 0;
+    private static final int UPDATE_INTERVAL_MS = 16; // ~60 FPS
+    private String last_bearing_text = "";
+    private int last_bearing_degrees = -1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Initialize UI elements
+        compassSensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        accelerometer = compassSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        magnetometer = compassSensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+
         tv_degrees = findViewById(R.id.tv_degrees);
         iv_compass = findViewById(R.id.iv_compass);
-
-        // Initialize sensor manager and sensors
-        compassSensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
-        if (compassSensorManager != null) {
-            accelerometer = compassSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-            magnetometer = compassSensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
-        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        // Register sensor listeners when activity resumes
-        if (accelerometer != null && magnetometer != null) {
+        if (accelerometer != null) {
             compassSensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_UI);
+        }
+        if (magnetometer != null) {
             compassSensorManager.registerListener(this, magnetometer, SensorManager.SENSOR_DELAY_UI);
         }
     }
@@ -54,99 +68,85 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     @Override
     protected void onPause() {
         super.onPause();
-        // Unregister sensor listeners when activity pauses to save battery
         compassSensorManager.unregisterListener(this);
     }
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER)
-            accel_read = event.values;
-        if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD)
-            magnetic_read = event.values;
+        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+            System.arraycopy(event.values, 0, acc_val, 0, event.values.length);
+            has_acc_data = true;
+        } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+            System.arraycopy(event.values, 0, mag_val, 0, event.values.length);
+            has_mag_data = true;
+        }
 
-        if (accel_read != null && magnetic_read != null) {
-            float R[] = new float[9];
-            float I[] = new float[9];
-            boolean successful_read = SensorManager.getRotationMatrix(R, I, accel_read, magnetic_read);
+        if (has_acc_data && has_mag_data) {
+            // Throttle updates to ~60 FPS for optimal performance
+            long current_time = System.currentTimeMillis();
+            if (current_time - last_update_time < UPDATE_INTERVAL_MS) {
+                return;
+            }
+            last_update_time = current_time;
 
-            if (successful_read) {
-                float orientation[] = new float[3];
-                SensorManager.getOrientation(R, orientation);
-                azimuth_angle = orientation[0];
-                float degrees = ((azimuth_angle * 180f) / (float) Math.PI);
+            if (SensorManager.getRotationMatrix(rotation_matrix, null, acc_val, mag_val)) {
+                SensorManager.getOrientation(rotation_matrix, orientation);
+                float azimuth_r = orientation[0];
+                float azimuth_d = (float) Math.toDegrees(azimuth_r);
 
-                // Normalize degrees to 0-360
-                if (degrees < 0) {
-                    degrees += 360;
+                // Normalize to 0-360
+                if (azimuth_d < 0) {
+                    azimuth_d += 360;
                 }
 
-                int degreesInt = Math.round(degrees);
-                String direction = getDirection(degrees);
+                // Apply low-pass filter for smooth rotation
+                current_azimuth = ALPHA * azimuth_d + (1 - ALPHA) * current_azimuth;
 
-                // Update the text view with both degrees and direction
-                tv_degrees.setText(degreesInt + "° " + direction);
+                // Rotate compass (negative to rotate opposite of device rotation)
+                iv_compass.setRotation(-current_azimuth);
 
-                // Rotate the compass image
-                RotateAnimation rotate = new RotateAnimation(
-                        current_degree,
-                        -degreesInt,
-                        Animation.RELATIVE_TO_SELF, 0.5f,
-                        Animation.RELATIVE_TO_SELF, 0.5f
-                );
-                rotate.setDuration(100);
-                rotate.setFillAfter(true);
-                iv_compass.startAnimation(rotate);
-                current_degree = -degreesInt;
+                // Optimization: Only update text if bearing changed significantly
+                int current_degrees = Math.round(current_azimuth);
+                if (Math.abs(current_degrees - last_bearing_degrees) >= 1) {
+                    String bearing_text = getBearingText(current_azimuth);
+                    if (!bearing_text.equals(last_bearing_text)) {
+                        tv_degrees.setText(bearing_text);
+                        last_bearing_text = bearing_text;
+                    }
+                    last_bearing_degrees = current_degrees;
+                }
             }
+        }
+    }
+
+    private String getBearingText(float azimuth_d) {
+        // Round azimuth for cleaner comparisons
+        int degrees = Math.round(azimuth_d);
+
+        // Check cardinal directions with tighter tolerance
+        if (degrees == 0 || degrees == 360) return "N  0°";
+        if (degrees == 90) return "E 0°";
+        if (degrees == 180) return "S 0°";
+        if (degrees == 270) return "W 0°";
+
+        // Determine quadrant and format bearing with angle within quadrant
+        if (degrees < 90) {
+            // North-East quadrant: 0-89° (same as azimuth)
+            return String.format(Locale.US, "NE %d°", degrees);
+        } else if (degrees < 180) {
+            // South-East quadrant: 90-179° becomes 0-89°
+            return String.format(Locale.US, "SE %d°", degrees - 90);
+        } else if (degrees < 270) {
+            // South-West quadrant: 180-269° becomes 0-89°
+            return String.format(Locale.US, "SW %d°", degrees - 180);
+        } else {
+            // North-West quadrant: 270-359° becomes 0-89°
+            return String.format(Locale.US, "NW %d°", degrees - 270);
         }
     }
 
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {
-        // Handle accuracy changes if needed
-    }
-
-    /**
-     * Convert degrees to compass direction
-     * @param degrees Current heading in degrees (0-360)
-     * @return String representation of the direction
-     */
-    private String getDirection(float degrees) {
-        String[] directions = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
-
-        // Calculate index (0-15) for 16-point compass
-        int index = (int) Math.round(degrees / 22.5) % 16;
-
-        // Return full direction names for better readability
-        return getFullDirectionName(directions[index]);
-    }
-
-    /**
-     * Convert abbreviated direction to full name
-     * @param abbr Abbreviated direction (e.g., "NW", "NNE")
-     * @return Full direction name
-     */
-    private String getFullDirectionName(String abbr) {
-        switch (abbr) {
-            case "N": return "North";
-            case "NNE": return "North-Northeast";
-            case "NE": return "Northeast";
-            case "ENE": return "East-Northeast";
-            case "E": return "East";
-            case "ESE": return "East-Southeast";
-            case "SE": return "Southeast";
-            case "SSE": return "South-Southeast";
-            case "S": return "South";
-            case "SSW": return "South-Southwest";
-            case "SW": return "Southwest";
-            case "WSW": return "West-Southwest";
-            case "W": return "West";
-            case "WNW": return "West-Northwest";
-            case "NW": return "Northwest";
-            case "NNW": return "North-Northwest";
-            default: return abbr;
-        }
+        // Not needed for this implementation
     }
 }
